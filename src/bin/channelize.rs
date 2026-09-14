@@ -26,6 +26,7 @@ use eframe::{
     egui::{self, CentralPanel, Context, Key, Slider, TopBottomPanel, Vec2, Visuals},
 };
 use egui_plotter::EguiBackend;
+use plotters::coord::{ranged1d::ValueFormatter, types::RangedCoordf64};
 use plotters::prelude::*;
 use plotters::style::text_anchor::{HPos, Pos, VPos};
 
@@ -39,7 +40,11 @@ const AXIS_FONT_SIZE: u32 = 14;
 const HORIZONTAL_LABEL_AREA_SIZE: u32 = 56;
 const VERTICAL_LABEL_AREA_SIZE: u32 = 72;
 const PLOT_SIDE_MARGIN: u32 = 12;
-const Y_AXIS_UNIT_OFFSET: i32 = 62;
+// egui-plotter rotates text around the unrotated text box, so a longer label
+// is shifted farther to the left. Use separate, compensated positions to keep
+// both vertical titles fully inside the canvas and visually aligned.
+const TIME_AXIS_UNIT_X: i32 = 40;
+const POWER_AXIS_UNIT_X: i32 = 52;
 const MIN_WINDOW_SIZE: Vec2 = Vec2::new(1200.0, 640.0);
 const INITIAL_WINDOW_SIZE: Vec2 = Vec2::new(1200.0, 700.0);
 
@@ -770,7 +775,6 @@ impl eframe::App for PlotWindow {
                 .unwrap();
 
             let (plot_width, plot_height) = cc.plotting_area().dim_in_pixel();
-            let (upper_plot_x_pixels, upper_plot_y_pixels) = cc.plotting_area().get_pixel_range();
             let waterfall = DynamicImage::ImageRgb8(
                 RgbImage::from_vec(self.state.nch as u32, self.state.ntime as u32, x).unwrap(),
             )
@@ -779,8 +783,16 @@ impl eframe::App for PlotWindow {
 
             let bmp: BitMapElement<_> = ((fmin_display, -waterfall_time_span), waterfall).into();
 
+            let waterfall_y_label_formatter = |value: &f64| {
+                if value.abs() < f64::EPSILON {
+                    String::new()
+                } else {
+                    RangedCoordf64::format(value)
+                }
+            };
             cc.configure_mesh()
                 .x_desc("Frequency (MHz)")
+                .y_label_formatter(&waterfall_y_label_formatter)
                 .label_style(("sans-serif", AXIS_FONT_SIZE))
                 .axis_desc_style(("sans-serif", AXIS_FONT_SIZE))
                 .draw()
@@ -791,18 +803,6 @@ impl eframe::App for PlotWindow {
                 .color(&BLACK)
                 .transform(FontTransform::Rotate270)
                 .pos(Pos::new(HPos::Center, VPos::Center));
-            root_area
-                .use_screen_coord()
-                .draw(&Text::new(
-                    "Time (s)",
-                    (
-                        upper_plot_x_pixels.start - Y_AXIS_UNIT_OFFSET,
-                        (upper_plot_y_pixels.start + upper_plot_y_pixels.end) / 2,
-                    ),
-                    y_axis_unit_style.clone(),
-                ))
-                .unwrap();
-
             let spec = self.spectrum_buf.lock().unwrap();
             let spec = if let Some(ref x) = self.state.floor {
                 &spec.view() / x
@@ -832,8 +832,6 @@ impl eframe::App for PlotWindow {
                 .set_label_area_size(LabelAreaPosition::Bottom, HORIZONTAL_LABEL_AREA_SIZE)
                 .build_cartesian_2d(spectrum_x_min..spectrum_x_max, ys1..ys2)
                 .unwrap();
-            let (lower_plot_x_pixels, lower_plot_y_pixels) = cc.plotting_area().get_pixel_range();
-
             cc.configure_mesh()
                 .x_desc("Frequency (MHz)")
                 .label_style(("sans-serif", AXIS_FONT_SIZE))
@@ -852,14 +850,18 @@ impl eframe::App for PlotWindow {
             ))
             .unwrap();
 
+            let (_, root_height) = root_area.dim_in_pixel();
             root_area
-                .use_screen_coord()
                 .draw(&Text::new(
-                    "Intensity (dB)",
-                    (
-                        lower_plot_x_pixels.start - Y_AXIS_UNIT_OFFSET,
-                        (lower_plot_y_pixels.start + lower_plot_y_pixels.end) / 2,
-                    ),
+                    "Time (s)",
+                    (TIME_AXIS_UNIT_X, root_height as i32 / 4),
+                    y_axis_unit_style.clone(),
+                ))
+                .unwrap();
+            root_area
+                .draw(&Text::new(
+                    "Power (dB)",
+                    (POWER_AXIS_UNIT_X, root_height as i32 * 3 / 4),
                     y_axis_unit_style,
                 ))
                 .unwrap();

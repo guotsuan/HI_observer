@@ -90,13 +90,13 @@ def plot_observation(
     waterfall_axis.tick_params(labelsize=14)
     waterfall_axis.set_title(title, fontsize=14)
     colorbar = figure.colorbar(image, ax=waterfall_axis, pad=0.01)
-    colorbar.set_label("Intensity (dB)", fontsize=14)
+    colorbar.set_label("Power (dB)", fontsize=14)
     colorbar.ax.tick_params(labelsize=14)
 
     spectrum_axis.plot(frequencies_mhz, spectrum_db, color="blue", linewidth=0.8)
     spectrum_axis.set_xlim(frequency_min_mhz, frequency_max_mhz)
     spectrum_axis.set_xlabel("Frequency (MHz)", fontsize=14)
-    spectrum_axis.set_ylabel("Intensity (dB)", fontsize=14)
+    spectrum_axis.set_ylabel("Power (dB)", fontsize=14)
     spectrum_axis.tick_params(labelsize=14)
     spectrum_axis.grid(True, which="both", linewidth=0.4, alpha=0.45)
     if spectrum_average_rows > 1:

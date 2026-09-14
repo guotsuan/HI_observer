@@ -156,7 +156,7 @@ time_resolution = nch × average / (2 × sample_rate)
 ## 3. 界面操作
 
 - 上半部分为瀑布图，横轴是 `Frequency (MHz)`，纵轴是 `Time (s)`。
-- 下半部分为实时频谱，横轴是 `Frequency (MHz)`，纵轴是 `Intensity (dB)`。
+- 下半部分为实时频谱，横轴是 `Frequency (MHz)`，纵轴是 `Power (dB)`。
 - `min ch` / `max ch`：选择显示的频率通道范围。
 - `zoom in`：调整下半部分频谱的纵轴显示范围。
 - `Reset`：取消参考谱除法，恢复普通频谱显示。

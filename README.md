@@ -22,7 +22,7 @@ SoapySDRUtil --probe="driver=airspy"
 
 - Rust stable（项目使用 Rust 2024 edition）
 - SoapySDR 0.8
-- SoapyAirspy 模块
+- [SoapyAirspy](https://github.com/pothosware/SoapyAirspy) 模块（依赖 SoapySDR 和 libairspy）
 - libairspy、libusb、pkg-config
 - 与本仓库同级放置的 [`rsdsp`](https://github.com/astrojhgu/rsdsp) 源码
 
@@ -50,6 +50,20 @@ cd HI_observer
 conda install -c conda-forge soapysdr soapysdr-module-airspy libairspy libusb pkg-config
 ```
 
+其中 `soapysdr-module-airspy` 就是 SoapyAirspy 插件。激活该 Conda 环境、连接 Airspy 后，可检查插件和设备：
+
+```bash
+SoapySDRUtil --info
+SoapySDRUtil --find="driver=airspy"
+SoapySDRUtil --probe="driver=airspy"
+```
+
+若 `--info` 没有列出 Airspy 模块，可临时指定 Conda 的插件目录后重试：
+
+```bash
+export SOAPY_SDR_PLUGIN_PATH="$CONDA_PREFIX/lib/SoapySDR/modules0.8"
+```
+
 安装 Rust：
 
 ```bash
@@ -65,11 +79,20 @@ RUSTFLAGS="-C link-arg=-Wl,-rpath,$CONDA_PREFIX/lib" \
 cargo build --release --bin channelize
 ```
 
-也可以直接下载 GitHub Releases 中的 `macos-arm64` 压缩包。解压后双击 `run_channelize.command`，或在终端运行 `bin/channelize`。发布包采用 ad-hoc 签名、未做 Apple 公证；若首次启动被 Gatekeeper 拦截，可在 Finder 中右键选择“打开”，确认程序来源后再运行。
+也可以直接下载 GitHub Releases 中的 `macos-arm64` 压缩包；包内已经包含 SoapyAirspy 及相关动态库，无需另外安装。解压后双击 `run_channelize.command`，或在终端运行 `bin/channelize`。发布包采用 ad-hoc 签名、未做 Apple 公证；若首次启动被 Gatekeeper 拦截，可在 Finder 中右键选择“打开”，确认程序来源后再运行。
 
 ### 1.4 Windows
 
-普通用户建议下载 GitHub Releases 中的 `windows-x64` 压缩包。解压后可双击 `run_channelize.bat`，发布包中已经包含 SoapySDR、SoapyAirspy、libairspy、libusb 及其必要 DLL。请保持 `bin` 和 `lib` 的相对目录结构不变。
+普通用户建议下载 GitHub Releases 中的 `windows-x64` 压缩包。解压后可双击 `run_channelize.bat`，发布包中已经包含 SoapySDR、SoapyAirspy、libairspy、libusb 及其必要 DLL，无需另外安装 SoapyAirspy。请保持 `bin` 和 `lib` 的相对目录结构不变。连接 Airspy 后，可在解压目录的 CMD 中验证：
+
+```bat
+set "SOAPY_SDR_PLUGIN_PATH=%CD%\lib\SoapySDR\modules0.8"
+bin\SoapySDRUtil.exe --info
+bin\SoapySDRUtil.exe --find="driver=airspy"
+bin\SoapySDRUtil.exe --probe="driver=airspy"
+```
+
+若需要独立安装开发环境，建议使用 [PothosSDR](https://github.com/pothosware/PothosSDR) 的 Windows 预编译安装程序，并安装 SoapyAirspy/Airspy 相关组件。Windows 10/11 通常可自动识别 Airspy；若设备管理器仍不能正确识别，再按 [Airspy 官方下载页](https://airspy.com/download/) 的说明安装 WinUSB compatibility driver。
 
 从源码原生编译需要 Rust GNU 工具链、MinGW-w64、SoapySDR 0.8、SoapyAirspy 和 Airspy/libusb 的 Windows 开发文件。相较之下，预编译包或 PothosSDR 环境更容易部署。
 

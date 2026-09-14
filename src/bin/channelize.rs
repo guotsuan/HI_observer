@@ -6,19 +6,17 @@ use ndarray::{Array1, Array2, s};
 
 use num::complex::Complex;
 use soapy_spec_acc::{
+    binary_observation::BinaryObservationWriter,
     daq::run_daq,
     fits_table::{FitsTableWriter, ObservationMetadata},
-    utils::write_data,
 };
 use soapysdr::{Device, Direction};
 use std::{
-    fs::{File, OpenOptions},
-    io::{BufWriter, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
 use eframe::{
@@ -30,9 +28,10 @@ use plotters::coord::{ranged1d::ValueFormatter, types::RangedCoordf64};
 use plotters::prelude::*;
 use plotters::style::text_anchor::{HPos, Pos, VPos};
 
-use crossbeam::channel::bounded;
+use crossbeam::channel::{Receiver, TryRecvError, bounded};
 
 type Ftype = f32;
+type FileDialogResult = Result<Option<PathBuf>, String>;
 
 // Plotters needs explicit space for axis labels. The old 5 px side areas
 // clipped values such as "-102.0" and the first/last frequency ticks.
@@ -57,7 +56,7 @@ struct SaveControl {
 }
 
 enum OutputWriter {
-    Binary(BufWriter<File>),
+    Binary(BinaryObservationWriter),
     Fits(FitsTableWriter),
 }
 
@@ -95,16 +94,9 @@ impl SaveControl {
             .map(str::to_ascii_lowercase);
         let writer = match extension.as_deref() {
             Some("bin") => {
-                let file = if append {
-                    OpenOptions::new().create(true).append(true).open(&path)
-                } else {
-                    OpenOptions::new()
-                        .create(true)
-                        .write(true)
-                        .truncate(true)
-                        .open(&path)
-                };
-                file.map(BufWriter::new).map(OutputWriter::Binary)
+                let mut metadata = self.metadata.clone();
+                metadata.center_frequency_hz = self.current_frequency_hz;
+                BinaryObservationWriter::open(&path, metadata, append).map(OutputWriter::Binary)
             }
             Some("fits" | "fit") => {
                 let mut metadata = self.metadata.clone();
@@ -132,7 +124,7 @@ impl SaveControl {
 
     fn stop_saving(&mut self) {
         let result = match self.writer.take() {
-            Some(OutputWriter::Binary(mut writer)) => writer.flush(),
+            Some(OutputWriter::Binary(writer)) => writer.finish(),
             Some(OutputWriter::Fits(writer)) => writer.finish(),
             None => return,
         };
@@ -143,7 +135,9 @@ impl SaveControl {
 
     fn write_spectrum(&mut self, spectrum: &[Ftype]) {
         let result = match self.writer.as_mut() {
-            Some(OutputWriter::Binary(writer)) => Some(write_data(writer, spectrum)),
+            Some(OutputWriter::Binary(writer)) => {
+                Some(writer.write_spectrum(self.current_frequency_hz, spectrum))
+            }
             Some(OutputWriter::Fits(writer)) => {
                 Some(writer.write_spectrum(self.current_frequency_hz, spectrum))
             }
@@ -168,7 +162,7 @@ impl SaveControl {
             .map(str::to_ascii_lowercase)
             .as_deref()
         {
-            Some("bin") => "Binary",
+            Some("bin") => "HI binary v1",
             Some("fits" | "fit") => "FITS table",
             _ => "Unsupported format",
         }
@@ -206,33 +200,81 @@ fn select_save_file() -> Result<Option<PathBuf>, String> {
 
 #[cfg(target_os = "windows")]
 fn select_save_file() -> Result<Option<PathBuf>, String> {
-    let script = concat!(
-        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ",
-        "Add-Type -AssemblyName System.Windows.Forms; ",
-        "$dialog = New-Object System.Windows.Forms.SaveFileDialog; ",
-        "$dialog.Title = 'Select file to save'; ",
-        "$dialog.FileName = 'observation.bin'; ",
-        "$dialog.Filter = 'Binary data (*.bin)|*.bin|FITS table (*.fits)|*.fits'; ",
-        "$dialog.AddExtension = $true; ",
-        "$dialog.OverwritePrompt = $true; ",
-        "if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) ",
-        "{ [Console]::Write($dialog.FileName) }",
-    );
-    let output = Command::new("powershell.exe")
-        .args(["-NoProfile", "-STA", "-Command", script])
-        .output()
-        .map_err(|error| format!("Could not open the file chooser: {error}"))?;
+    use windows::{
+        Win32::{
+            System::Com::{
+                CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+                CoTaskMemFree, CoUninitialize,
+            },
+            UI::Shell::{
+                Common::COMDLG_FILTERSPEC, FOS_FORCEFILESYSTEM, FOS_OVERWRITEPROMPT,
+                FOS_PATHMUSTEXIST, FileSaveDialog, IFileSaveDialog, SIGDN_FILESYSPATH,
+            },
+        },
+        core::{HRESULT, w},
+    };
 
-    if output.status.success() {
-        let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        Ok((!path.is_empty()).then(|| PathBuf::from(path)))
-    } else {
-        let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        Err(if message.is_empty() {
-            "The file chooser closed unexpectedly".to_owned()
-        } else {
-            message
-        })
+    const ERROR_CANCELLED_HRESULT: HRESULT = HRESULT(0x8007_04c7_u32 as i32);
+
+    unsafe {
+        CoInitializeEx(None, COINIT_APARTMENTTHREADED)
+            .ok()
+            .map_err(|error| format!("Could not initialize the Windows file chooser: {error}"))?;
+
+        let result = (|| {
+            let dialog: IFileSaveDialog =
+                CoCreateInstance(&FileSaveDialog, None, CLSCTX_INPROC_SERVER).map_err(|error| {
+                    format!("Could not create the Windows file chooser: {error}")
+                })?;
+
+            let filters = [
+                COMDLG_FILTERSPEC {
+                    pszName: w!("Binary data (*.bin)"),
+                    pszSpec: w!("*.bin"),
+                },
+                COMDLG_FILTERSPEC {
+                    pszName: w!("FITS table (*.fits;*.fit)"),
+                    pszSpec: w!("*.fits;*.fit"),
+                },
+            ];
+            dialog
+                .SetTitle(w!("Select file to save"))
+                .and_then(|_| dialog.SetFileName(w!("observation.bin")))
+                .and_then(|_| dialog.SetFileTypes(&filters))
+                .and_then(|_| dialog.SetFileTypeIndex(1))
+                .and_then(|_| dialog.SetDefaultExtension(w!("bin")))
+                .and_then(|_| {
+                    dialog.SetOptions(
+                        dialog.GetOptions()?
+                            | FOS_FORCEFILESYSTEM
+                            | FOS_PATHMUSTEXIST
+                            | FOS_OVERWRITEPROMPT,
+                    )
+                })
+                .map_err(|error| format!("Could not configure the file chooser: {error}"))?;
+
+            match dialog.Show(None) {
+                Ok(()) => {}
+                Err(error) if error.code() == ERROR_CANCELLED_HRESULT => return Ok(None),
+                Err(error) => return Err(format!("The file chooser failed: {error}")),
+            }
+
+            let item = dialog
+                .GetResult()
+                .map_err(|error| format!("Could not read the selected file: {error}"))?;
+            let raw_path = item
+                .GetDisplayName(SIGDN_FILESYSPATH)
+                .map_err(|error| format!("Could not read the selected path: {error}"))?;
+            let path = raw_path
+                .to_string()
+                .map(PathBuf::from)
+                .map_err(|error| format!("The selected path is not valid Unicode: {error}"));
+            CoTaskMemFree(Some(raw_path.as_ptr().cast()));
+            path.map(Some)
+        })();
+
+        CoUninitialize();
+        result
     }
 }
 
@@ -563,6 +605,7 @@ struct PlotWindow {
     pub spectrum_buf: Arc<Mutex<Array1<f32>>>,
     pub state: State,
     pub save_control: Arc<Mutex<SaveControl>>,
+    file_dialog_receiver: Option<Receiver<FileDialogResult>>,
 }
 
 impl PlotWindow {
@@ -589,12 +632,38 @@ impl PlotWindow {
             spectrum_buf: sbuf,
             state,
             save_control,
+            file_dialog_receiver: None,
+        }
+    }
+
+    fn poll_file_dialog(&mut self) {
+        let result = match self.file_dialog_receiver.as_ref() {
+            Some(receiver) => match receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => Some(Err(
+                    "The file chooser closed without returning a result".to_owned(),
+                )),
+            },
+            None => None,
+        };
+
+        let Some(result) = result else {
+            return;
+        };
+        self.file_dialog_receiver = None;
+        match result {
+            Ok(Some(path)) => self.save_control.lock().unwrap().select_path(path),
+            Ok(None) => {}
+            Err(error) => self.save_control.lock().unwrap().error = Some(error),
         }
     }
 }
 
 impl eframe::App for PlotWindow {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_file_dialog();
+
         let (min_value, max_value) = self
             .waterfall_img
             .lock()
@@ -657,15 +726,26 @@ impl eframe::App for PlotWindow {
                 }
 
                 let is_saving = self.save_control.lock().unwrap().is_saving();
+                let file_dialog_open = self.file_dialog_receiver.is_some();
+                let select_file_label = if file_dialog_open {
+                    "Opening file dialog..."
+                } else {
+                    "Select file to save"
+                };
                 if ui
-                    .add_enabled(!is_saving, egui::Button::new("Select file to save"))
+                    .add_enabled(
+                        !is_saving && !file_dialog_open,
+                        egui::Button::new(select_file_label),
+                    )
                     .clicked()
                 {
-                    match select_save_file() {
-                        Ok(Some(path)) => self.save_control.lock().unwrap().select_path(path),
-                        Ok(None) => {}
-                        Err(error) => self.save_control.lock().unwrap().error = Some(error),
-                    }
+                    let (sender, receiver) = bounded(1);
+                    self.file_dialog_receiver = Some(receiver);
+                    let context = ctx.clone();
+                    std::thread::spawn(move || {
+                        let _ = sender.send(select_save_file());
+                        context.request_repaint();
+                    });
                 }
 
                 if ui.button("Excl").clicked() {
@@ -939,11 +1019,16 @@ mod tests {
         assert!(save.error.is_none());
 
         let bytes = std::fs::read(&path).unwrap();
-        let expected = values
-            .iter()
-            .flat_map(|value| value.to_ne_bytes())
-            .collect::<Vec<_>>();
-        assert_eq!(bytes, expected);
+        assert_eq!(
+            &bytes[..8],
+            &soapy_spec_acc::binary_observation::BINARY_MAGIC
+        );
+        assert_eq!(
+            bytes.len(),
+            soapy_spec_acc::binary_observation::BINARY_HEADER_SIZE
+                + soapy_spec_acc::binary_observation::BINARY_ROW_HEADER_SIZE
+                + values.len() * size_of::<f32>()
+        );
 
         std::fs::remove_file(path).unwrap();
     }

@@ -4,10 +4,63 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
+import struct
+import warnings
 
 import matplotlib.pyplot as plt
 import numpy as np
+
+
+BINARY_MAGIC = b"HIOBIN01"
+BINARY_VERSION = 1
+BINARY_HEADER_SIZE = 256
+BINARY_ROW_HEADER_SIZE = 16
+BINARY_ENDIAN_MARKER = 0x01020304
+
+
+@dataclass(frozen=True)
+class BinMetadata:
+    """Metadata stored in an HI Observer versioned binary header."""
+
+    version: int
+    start_unix_ns: int
+    end_unix_ns: int
+    initial_center_frequency_hz: float
+    sample_rate_hz: float
+    channel_width_hz: float
+    time_resolution_sec: float
+    channel_count: int
+    average_count: int
+    pfb_taps: int
+    lna_gain_db: float
+    mix_gain_db: float
+    vga_gain_db: float
+    declared_row_count: int
+    declared_elapsed_sec: float
+    row_size: int
+
+    @property
+    def start_time_utc(self) -> datetime:
+        return datetime.fromtimestamp(self.start_unix_ns * 1e-9, tz=timezone.utc)
+
+    @property
+    def end_time_utc(self) -> datetime:
+        return datetime.fromtimestamp(self.end_unix_ns * 1e-9, tz=timezone.utc)
+
+
+@dataclass(frozen=True)
+class BinObservation:
+    """Spectra and coordinates loaded from either binary format."""
+
+    spectra: np.ndarray
+    times_sec: np.ndarray
+    center_frequencies_hz: np.ndarray
+    sample_rate_hz: float
+    channel_count: int
+    metadata: BinMetadata | None
 
 
 def positive_power_db(values: np.ndarray) -> np.ndarray:
@@ -113,11 +166,120 @@ def plot_observation(
         plt.close(figure)
 
 
-def read_bin(
+def parse_versioned_header(header: bytes) -> BinMetadata:
+    """Decode and validate the fixed 256-byte little-endian header."""
+    if len(header) != BINARY_HEADER_SIZE:
+        raise ValueError("the versioned binary header is incomplete")
+    if header[:8] != BINARY_MAGIC:
+        raise ValueError("not an HI Observer versioned binary file")
+
+    version, header_size, endian_marker = struct.unpack_from("<III", header, 8)
+    if version != BINARY_VERSION:
+        raise ValueError(f"unsupported HI Observer binary version {version}")
+    if header_size != BINARY_HEADER_SIZE:
+        raise ValueError(f"unsupported binary header size {header_size}")
+    if endian_marker != BINARY_ENDIAN_MARKER:
+        raise ValueError("invalid binary byte-order marker")
+
+    start_unix_ns = struct.unpack_from("<q", header, 24)[0]
+    initial_center_frequency_hz, sample_rate_hz = struct.unpack_from(
+        "<dd", header, 32
+    )
+    channel_width_hz, time_resolution_sec = struct.unpack_from("<dd", header, 56)
+    channel_count, average_count, pfb_taps, value_type = struct.unpack_from(
+        "<IIII", header, 72
+    )
+    lna_gain_db, mix_gain_db, vga_gain_db = struct.unpack_from("<ddd", header, 88)
+    row_header_size, value_size = struct.unpack_from("<II", header, 112)
+    row_size, declared_row_count = struct.unpack_from("<QQ", header, 120)
+    end_unix_ns = struct.unpack_from("<q", header, 136)[0]
+    declared_elapsed_sec = struct.unpack_from("<d", header, 144)[0]
+
+    expected_row_size = BINARY_ROW_HEADER_SIZE + channel_count * 4
+    if channel_count <= 0:
+        raise ValueError("binary header has no frequency channels")
+    if value_type != 1 or value_size != 4:
+        raise ValueError("binary file does not contain float32 linear-power values")
+    if row_header_size != BINARY_ROW_HEADER_SIZE or row_size != expected_row_size:
+        raise ValueError("binary header has an invalid row layout")
+    if sample_rate_hz <= 0.0 or channel_width_hz <= 0.0:
+        raise ValueError("binary header has invalid frequency metadata")
+
+    return BinMetadata(
+        version=version,
+        start_unix_ns=start_unix_ns,
+        end_unix_ns=end_unix_ns,
+        initial_center_frequency_hz=initial_center_frequency_hz,
+        sample_rate_hz=sample_rate_hz,
+        channel_width_hz=channel_width_hz,
+        time_resolution_sec=time_resolution_sec,
+        channel_count=channel_count,
+        average_count=average_count,
+        pfb_taps=pfb_taps,
+        lna_gain_db=lna_gain_db,
+        mix_gain_db=mix_gain_db,
+        vga_gain_db=vga_gain_db,
+        declared_row_count=declared_row_count,
+        declared_elapsed_sec=declared_elapsed_sec,
+        row_size=row_size,
+    )
+
+
+def read_versioned_bin(path: Path, rows: int) -> BinObservation:
+    """Read the self-describing HIOBIN01 format."""
+    with path.open("rb") as source:
+        metadata = parse_versioned_header(source.read(BINARY_HEADER_SIZE))
+
+    file_size = path.stat().st_size
+    data_size = file_size - BINARY_HEADER_SIZE
+    complete_row_count, trailing_bytes = divmod(data_size, metadata.row_size)
+    if trailing_bytes:
+        warnings.warn(
+            f"ignoring {trailing_bytes} trailing bytes from an incomplete final row",
+            stacklevel=2,
+        )
+    if complete_row_count == 0:
+        raise ValueError(f"{path} contains no complete spectra")
+    if metadata.declared_row_count not in (0, complete_row_count):
+        warnings.warn(
+            f"header declares {metadata.declared_row_count} rows, but the file contains "
+            f"{complete_row_count} complete rows; using the complete rows",
+            stacklevel=2,
+        )
+
+    selected_count = complete_row_count if rows <= 0 else min(rows, complete_row_count)
+    first_row = complete_row_count - selected_count
+    row_dtype = np.dtype(
+        [
+            ("time", "<f8"),
+            ("center_frequency", "<f8"),
+            ("spectrum", "<f4", (metadata.channel_count,)),
+        ]
+    )
+    records = np.fromfile(
+        path,
+        dtype=row_dtype,
+        count=selected_count,
+        offset=BINARY_HEADER_SIZE + first_row * metadata.row_size,
+    )
+    return BinObservation(
+        spectra=np.asarray(records["spectrum"], dtype=np.float32).copy(),
+        times_sec=np.asarray(records["time"], dtype=np.float64).copy(),
+        center_frequencies_hz=np.asarray(
+            records["center_frequency"], dtype=np.float64
+        ).copy(),
+        sample_rate_hz=metadata.sample_rate_hz,
+        channel_count=metadata.channel_count,
+        metadata=metadata,
+    )
+
+
+def read_legacy_bin(
     path: Path,
     channel_count: int,
     rows: int,
 ) -> np.ndarray:
+    """Read the original headerless float32 format."""
     if channel_count <= 0:
         raise ValueError("--nch must be positive")
     values = np.fromfile(path, dtype="<f4")
@@ -132,6 +294,78 @@ def read_bin(
     return spectra[-rows:] if rows > 0 else spectra
 
 
+def read_bin(
+    path: Path,
+    rows: int,
+    *,
+    legacy_center_frequency_hz: float | None,
+    legacy_sample_rate_hz: float,
+    legacy_channel_count: int,
+    legacy_average_count: int,
+    legacy_time_resolution_sec: float | None,
+) -> BinObservation:
+    """Auto-detect the self-describing format, with legacy raw fallback."""
+    with path.open("rb") as source:
+        magic = source.read(len(BINARY_MAGIC))
+    if magic == BINARY_MAGIC:
+        return read_versioned_bin(path, rows)
+
+    if legacy_center_frequency_hz is None:
+        raise ValueError(
+            "legacy headerless .bin files require --center-frequency; "
+            "also verify --sample-rate, --nch, and --average"
+        )
+    spectra = read_legacy_bin(path, legacy_channel_count, rows)
+    time_resolution_sec = legacy_time_resolution_sec
+    if time_resolution_sec is None:
+        time_resolution_sec = (
+            legacy_channel_count
+            * legacy_average_count
+            / (2.0 * legacy_sample_rate_hz)
+        )
+    return BinObservation(
+        spectra=spectra,
+        times_sec=np.arange(spectra.shape[0], dtype=np.float64)
+        * time_resolution_sec,
+        center_frequencies_hz=np.full(
+            spectra.shape[0], legacy_center_frequency_hz, dtype=np.float64
+        ),
+        sample_rate_hz=legacy_sample_rate_hz,
+        channel_count=legacy_channel_count,
+        metadata=None,
+    )
+
+
+def print_metadata(observation: BinObservation) -> None:
+    """Print the metadata that controls the plotted coordinates."""
+    metadata = observation.metadata
+    if metadata is None:
+        print("Format: legacy headerless float32")
+        print(f"Rows loaded: {observation.spectra.shape[0]}")
+        print(f"Channels: {observation.channel_count}")
+        return
+
+    print(f"Format: HI Observer binary v{metadata.version}")
+    print(f"Observation start (UTC): {metadata.start_time_utc.isoformat()}")
+    print(f"Observation end (UTC): {metadata.end_time_utc.isoformat()}")
+    print(f"Recorded elapsed time: {metadata.declared_elapsed_sec:.6f} s")
+    print(f"Rows in file header: {metadata.declared_row_count}")
+    print(f"Rows loaded: {observation.spectra.shape[0]}")
+    print(f"Channels: {metadata.channel_count}")
+    print(f"Initial center frequency: {metadata.initial_center_frequency_hz:.6f} Hz")
+    print(f"Sample rate: {metadata.sample_rate_hz:.6f} Hz")
+    print(f"Channel width: {metadata.channel_width_hz:.6f} Hz")
+    print(f"Nominal row interval: {metadata.time_resolution_sec:.9f} s")
+    print(f"Average count: {metadata.average_count}")
+    print(f"PFB taps: {metadata.pfb_taps}")
+    print(
+        "Gains: "
+        f"LNA={metadata.lna_gain_db:g} dB, "
+        f"MIX={metadata.mix_gain_db:g} dB, "
+        f"VGA={metadata.vga_gain_db:g} dB"
+    )
+
+
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Plot a raw HI Observer .bin recording."
@@ -140,29 +374,30 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--center-frequency",
         type=float,
-        required=True,
         metavar="HZ",
-        help="observation center frequency in Hz",
+        help="center frequency in Hz; required only for legacy headerless files",
     )
     parser.add_argument(
         "--sample-rate",
         type=float,
         default=6e6,
         metavar="HZ",
-        help="sample rate in Hz (default: 6e6)",
+        help="legacy sample rate in Hz (default: 6e6)",
     )
-    parser.add_argument("--nch", type=int, default=4096, help="channel count (default: 4096)")
+    parser.add_argument(
+        "--nch", type=int, default=4096, help="legacy channel count (default: 4096)"
+    )
     parser.add_argument(
         "--average",
         type=int,
         default=128,
-        help="number of spectra averaged per saved row",
+        help="legacy number of spectra averaged per saved row (default: 128)",
     )
     parser.add_argument(
         "--time-resolution",
         type=float,
         metavar="SECONDS",
-        help="saved-row interval; defaults to nch*average/(2*sample_rate)",
+        help="legacy saved-row interval; otherwise derived from legacy parameters",
     )
     parser.add_argument(
         "--rows",
@@ -177,7 +412,7 @@ def parse_arguments() -> argparse.Namespace:
         metavar="N",
         help="average the last N rows for the lower spectrum (default: 1)",
     )
-    parser.add_argument("--title", default="HI Observation", help="plot title")
+    parser.add_argument("--title", help="plot title")
     parser.add_argument("--output", type=Path, help="save the plot to an image file")
     parser.add_argument(
         "--no-show", action="store_true", help="do not open an interactive plot window"
@@ -192,24 +427,51 @@ def main() -> None:
         if args.rows <= 0
         else max(args.rows, args.spectrum_average)
     )
-    spectra = read_bin(args.input, args.nch, rows_to_read)
-    time_resolution = args.time_resolution
-    if time_resolution is None:
-        time_resolution = args.nch * args.average / (2.0 * args.sample_rate)
-    times_sec = np.arange(spectra.shape[0], dtype=np.float64) * time_resolution
-    channel_width_hz = args.sample_rate / args.nch
-    frequency_min_hz = args.center_frequency - args.sample_rate / 2.0
-    frequency_max_hz = args.center_frequency + args.sample_rate / 2.0
-    frequencies_hz = frequency_min_hz + np.arange(args.nch) * channel_width_hz
+    observation = read_bin(
+        args.input,
+        rows_to_read,
+        legacy_center_frequency_hz=args.center_frequency,
+        legacy_sample_rate_hz=args.sample_rate,
+        legacy_channel_count=args.nch,
+        legacy_average_count=args.average,
+        legacy_time_resolution_sec=args.time_resolution,
+    )
+    print_metadata(observation)
+
+    center_frequency_hz = float(observation.center_frequencies_hz[-1])
+    channel_width_hz = observation.sample_rate_hz / observation.channel_count
+    if not np.allclose(
+        observation.center_frequencies_hz,
+        center_frequency_hz,
+        rtol=0.0,
+        atol=channel_width_hz / 2.0,
+    ):
+        warnings.warn(
+            "center frequency changed within the selected rows; the waterfall is "
+            "displayed on the final row's frequency grid",
+            stacklevel=2,
+        )
+    frequency_min_hz = center_frequency_hz - observation.sample_rate_hz / 2.0
+    frequency_max_hz = center_frequency_hz + observation.sample_rate_hz / 2.0
+    frequencies_hz = frequency_min_hz + np.arange(
+        observation.channel_count
+    ) * channel_width_hz
+    title = args.title
+    if title is None:
+        if observation.metadata is None:
+            title = "HI Observation"
+        else:
+            start = observation.metadata.start_time_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+            title = f"HI Observation — {start}"
 
     plot_observation(
-        spectra,
-        times_sec,
+        observation.spectra,
+        observation.times_sec,
         frequencies_hz,
         (frequency_min_hz, frequency_max_hz),
         waterfall_rows=args.rows,
         spectrum_average_rows=args.spectrum_average,
-        title=args.title,
+        title=title,
         output=args.output,
         show=not args.no_show,
     )

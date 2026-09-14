@@ -1,6 +1,6 @@
 # HI Observer
 
-HI Observer 是一个面向 Airspy 接收机的实时射电频谱观测程序。程序通过 SoapySDR 采集 IQ 数据，经过多相滤波器组（PFB）生成频谱，同时显示瀑布图和当前频谱，并可把观测结果保存为原始二进制文件或 FITS Binary Table。
+HI Observer 是一个面向 Airspy 接收机的实时射电频谱观测程序。程序通过 SoapySDR 采集 IQ 数据，经过多相滤波器组（PFB）生成频谱，同时显示瀑布图和当前频谱，并可把观测结果保存为自描述二进制文件或 FITS Binary Table。
 
 当前主要可执行程序是 `channelize`，支持 macOS、Windows 和 Linux。GitHub Releases 中的预编译包已经包含运行时所需的 SoapySDR/Airspy 动态库；从源码编译时仍需安装下述开发依赖。
 
@@ -176,11 +176,24 @@ time_resolution = nch × average / (2 × sample_rate)
 4. 点击 `Start to save` 开始写入，按钮会变为 `Stop saving`，同时显示 `Recording`。
 5. 观测结束时点击 `Stop saving`。关闭主窗口时程序也会尝试正常结束保存。
 
-选择文件以后才会创建或覆盖它。通过界面开始保存会覆盖同名文件；命令行 `--out file.bin` 保留原有 `.bin` 追加行为，而 `--out file.fits` 会创建新的 FITS 观测文件。
+选择文件以后才会创建或覆盖它。通过界面开始保存会覆盖同名文件；命令行 `--out file.bin` 可以向参数一致的新格式 BIN 文件追加记录，`--out file.fits` 会创建新的 FITS 观测文件。为避免破坏历史数据，新程序不会向旧版无文件头的裸 BIN 文件追加记录。
 
 ### 4.2 `.bin` 格式
 
-`.bin` 文件按时间顺序连续保存频谱行。每行包含 `nch` 个小端 `float32`，数值为平均后的线性功率，没有文件头或元数据。因此读取时必须另外知道中心频率、采样率、通道数、平均数等运行参数。
+新版 `.bin` 是自描述的小端二进制观测格式。文件以 `HIOBIN01` 魔数和 256 字节固定文件头开始，文件头包含：
+
+- 格式版本、UTC 开始/结束时间、完整频谱行数和观测时长；
+- 初始中心频率、采样率、带宽、通道宽度和上下频率边界；
+- 数组长度（`nch`）、平均数、PFB 抽头数；
+- LNA、MIX、VGA 增益以及数据类型和每行字节数。
+
+文件头之后的每行依次包含：
+
+- `TIME`：相对观测开始时间的实际经过时间，`float64`，单位秒；
+- `FREQUENCY`：该行采集时的中心频率，`float64`，单位 Hz；
+- `SPECTRUM`：长度为 `nch` 的小端 `float32` 线性功率数组。
+
+停止保存时程序会更新文件头中的结束时间、观测时长和行数。若程序异常中止，`plot_bin.py` 仍会按文件大小读取所有完整行，并忽略不完整的最后一行。
 
 ### 4.3 FITS 格式
 
@@ -206,12 +219,10 @@ python3 -m pip install numpy matplotlib astropy
 
 ### 5.1 读取 `.bin`
 
-由于 `.bin` 不含元数据，必须至少给出输入文件和中心频率，并确保 `--sample-rate`、`--nch`、`--average` 与采集参数一致：
+新版 `.bin` 已包含绘图所需元数据，通常只需指定文件名：
 
 ```bash
 python3 scripts/plot_bin.py observation.bin \
-  --center-frequency 1420.405751e6 \
-  --sample-rate 6e6 --nch 4096 --average 128 \
   --rows 512 --spectrum-average 32
 ```
 
@@ -221,6 +232,14 @@ python3 scripts/plot_bin.py observation.bin \
 python3 scripts/plot_bin.py observation.bin \
   --center-frequency 1420.405751e6 \
   --output observation-bin.png --no-show
+```
+
+脚本会自动打印文件头中的 UTC 观测时间、中心频率、采样率、通道数、时间分辨率、PFB 参数和增益。读取旧版无文件头的裸 BIN 文件时仍受支持，但必须提供中心频率，并确认其他参数与采集时一致：
+
+```bash
+python3 scripts/plot_bin.py legacy.bin \
+  --center-frequency 1420.405751e6 \
+  --sample-rate 6e6 --nch 512 --average 128
 ```
 
 ### 5.2 读取 FITS

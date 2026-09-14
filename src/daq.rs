@@ -34,7 +34,6 @@ pub fn run_daq(
         let t0 = Utc::now().timestamp_millis(); // e.g. `2014-11-28T12:45:59.324310806Z`
         let mut sigma = None;
         loop {
-            //let mut buf = vec![Complex::<Ftype>::default(); stream.mtu().unwrap()];
             let mut buf = Vec::with_capacity(sdr_stream.mtu().unwrap());
             buf.resize(sdr_stream.mtu().unwrap(), Complex::default());
             let len = sdr_stream
@@ -54,19 +53,12 @@ pub fn run_daq(
                 sigma = Some(sigma1);
             }
 
-            if !tx_raw.is_full() {
-                if tx_raw.send(buf).is_err() {
-                    break;
-                }
-            } else {
-                eprintln!("WARNING: daq queue full, data losting");
+            if !tx_raw.is_full() && tx_raw.send(buf).is_err() {
+                break;
             }
 
-            //pfb.analyze_par(&buf[..len]);
             cnt += 1;
             num += len as i64;
-            //println!("{}", num);
-            //println!("{}", len);
             if cnt % 100 == 0 {
                 let t1 = Utc::now().timestamp_millis();
                 let dt_sec = (t1 - t0) as f64 / 1000.0;
@@ -86,7 +78,9 @@ pub fn run_daq(
     std::thread::spawn(move || {
         loop {
             let data: Vec<Complex<f32>> = rx_raw.recv().unwrap();
-            pfb.analyze_raw_par(&data).axis_iter(Axis(0)).for_each(|x| {
+            let analyzed = pfb.analyze_raw_par(&data);
+            let mut receiver_disconnected = false;
+            for x in analyzed.axis_iter(Axis(0)) {
                 let x1 = Array1::from_iter(
                     x.slice(s![nch / 2..nch])
                         .iter()
@@ -95,32 +89,28 @@ pub fn run_daq(
                 );
                 if !tx_spectrum.is_full() {
                     if tx_spectrum.send(x1).is_err() {
-                        return;
+                        receiver_disconnected = true;
+                        break;
                     }
                 } else {
                     println!("WARNING: spectrum queue is full, skipping");
                 }
-            });
+            }
+            if receiver_disconnected {
+                break;
+            }
         }
     });
 
     let (tx_averaged, rx_averaged) = bounded(16);
 
     std::thread::spawn(move || {
-        //let mut filtered_result=Array1::<Ftype>::zeros(NCH);
-        //let mut outfile=File::create("./a.bin").unwrap();
-
-        //let udp = UdpSocket::bind(format!("127.0.0.1:{}", args.tx_port)).unwrap();
         loop {
             let mut temp = Array1::<Ftype>::zeros(nch);
             for _i in 0..n_average {
                 temp = temp + rx_spectrum.recv().unwrap();
             }
             temp /= n_average as Ftype;
-
-            //filtered_result=filtered_result*K+temp*(1 as Ftype-K);
-            //send_data(&udp, temp.as_slice().unwrap(), &addr);
-            //write_data(&mut outfile, filtered_result.as_slice().unwrap());
 
             if !tx_averaged.is_full() && temp.iter().all(|&x| x > 0_f32) {
                 if tx_averaged.send(temp).is_err() {

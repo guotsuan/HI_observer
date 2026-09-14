@@ -1,0 +1,22 @@
+# Rust build products and cross-compilation environments
+/target/
+
+# Packaged release artifacts are uploaded to GitHub Releases, not committed
+/dist/
+
+# Observation data can be very large
+*.bin
+*.fit
+*.fits
+
+# Python cache and virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editor and operating-system files
+.DS_Store
+.idea/
+.vscode/
+*~

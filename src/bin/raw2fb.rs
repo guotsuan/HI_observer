@@ -25,20 +25,10 @@ struct Args {
     #[clap(short('s'), value_name("sampling rate in MHz"), default_value("6"))]
     sampling_rate: u32,
 
-    #[clap(
-        short('i'),
-        long("in"),
-        value_name("input raw"),
-        //default_value("6")
-    )]
+    #[clap(short('i'), long("in"), value_name("input raw"))]
     inname: String,
 
-    #[clap(
-        short('o'),
-        long("out"),
-        value_name("output filterbank file"),
-        //default_value("6")
-    )]
+    #[clap(short('o'), long("out"), value_name("output filterbank file"))]
     outname: String,
 
     #[clap(long("osr"), value_name("oversampling ratio"), default_value("2"))]
@@ -70,7 +60,7 @@ pub fn main() -> Result<(), std::io::Error> {
         buf1.iter_mut().zip(buf.iter().rev()).for_each(|(a, &b)| {
             *a = b;
         });
-        write_data(&mut outfile, &buf1);
+        write_data(&mut outfile, &buf1)?;
     }
     Ok(())
 }

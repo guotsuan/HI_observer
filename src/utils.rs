@@ -3,14 +3,20 @@ use std::{
     net::{ToSocketAddrs, UdpSocket},
 };
 
-pub fn write_data<T: Sized + Default + Clone, W: Write>(drain: &mut W, buf: &[T]) {
+pub fn write_data<T: Sized + Default + Clone, W: Write>(
+    drain: &mut W,
+    buf: &[T],
+) -> Result<(), std::io::Error> {
     let buf = unsafe {
         std::slice::from_raw_parts(buf.as_ptr() as *const u8, std::mem::size_of_val(buf))
     };
-    drain.write_all(buf).unwrap();
+    drain.write_all(buf)
 }
 
-pub fn read_data<T: Sized + Default + Clone, R: Read>(source: &mut R, buf: &mut [T]) -> Result<(), std::io::Error>{
+pub fn read_data<T: Sized + Default + Clone, R: Read>(
+    source: &mut R,
+    buf: &mut [T],
+) -> Result<(), std::io::Error> {
     let buf = unsafe {
         std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, std::mem::size_of_val(buf))
     };

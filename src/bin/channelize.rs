@@ -4,15 +4,22 @@ use egui::ViewportBuilder;
 use image::{DynamicImage, RgbImage, imageops::FilterType::Nearest};
 use ndarray::{Array1, Array2, s};
 
-//use rayon::prelude::*;
-
 use num::complex::Complex;
-use soapy_spec_acc::{daq::run_daq, utils::write_data};
+use soapy_spec_acc::{
+    daq::run_daq,
+    fits_table::{FitsTableWriter, ObservationMetadata},
+    utils::write_data,
+};
 use soapysdr::{Device, Direction};
 use std::{
-    fs::OpenOptions,
+    fs::{File, OpenOptions},
+    io::{BufWriter, Write},
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use std::process::Command;
 
 use eframe::{
     Renderer,
@@ -20,10 +27,241 @@ use eframe::{
 };
 use egui_plotter::EguiBackend;
 use plotters::prelude::*;
+use plotters::style::text_anchor::{HPos, Pos, VPos};
 
 use crossbeam::channel::bounded;
 
 type Ftype = f32;
+
+// Plotters needs explicit space for axis labels. The old 5 px side areas
+// clipped values such as "-102.0" and the first/last frequency ticks.
+const AXIS_FONT_SIZE: u32 = 14;
+const HORIZONTAL_LABEL_AREA_SIZE: u32 = 56;
+const VERTICAL_LABEL_AREA_SIZE: u32 = 72;
+const PLOT_SIDE_MARGIN: u32 = 12;
+const Y_AXIS_UNIT_OFFSET: i32 = 62;
+const MIN_WINDOW_SIZE: Vec2 = Vec2::new(1200.0, 640.0);
+const INITIAL_WINDOW_SIZE: Vec2 = Vec2::new(1200.0, 700.0);
+
+struct SaveControl {
+    selected_path: Option<PathBuf>,
+    writer: Option<OutputWriter>,
+    metadata: ObservationMetadata,
+    current_frequency_hz: f64,
+    error: Option<String>,
+}
+
+enum OutputWriter {
+    Binary(BufWriter<File>),
+    Fits(FitsTableWriter),
+}
+
+impl SaveControl {
+    fn new(selected_path: Option<PathBuf>, metadata: ObservationMetadata) -> Self {
+        let current_frequency_hz = metadata.center_frequency_hz;
+        Self {
+            selected_path,
+            writer: None,
+            metadata,
+            current_frequency_hz,
+            error: None,
+        }
+    }
+
+    fn is_saving(&self) -> bool {
+        self.writer.is_some()
+    }
+
+    fn select_path(&mut self, path: PathBuf) {
+        self.stop_saving();
+        self.selected_path = Some(path);
+        self.error = None;
+    }
+
+    fn start_saving(&mut self, append: bool) {
+        let Some(path) = self.selected_path.clone() else {
+            self.error = Some("Select a file before starting to save".to_owned());
+            return;
+        };
+
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase);
+        let writer = match extension.as_deref() {
+            Some("bin") => {
+                let file = if append {
+                    OpenOptions::new().create(true).append(true).open(&path)
+                } else {
+                    OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .truncate(true)
+                        .open(&path)
+                };
+                file.map(BufWriter::new).map(OutputWriter::Binary)
+            }
+            Some("fits" | "fit") => {
+                let mut metadata = self.metadata.clone();
+                metadata.center_frequency_hz = self.current_frequency_hz;
+                FitsTableWriter::create(&path, metadata).map(OutputWriter::Fits)
+            }
+            _ => {
+                self.writer = None;
+                self.error = Some("Unsupported file type; use .bin, .fits, or .fit".to_owned());
+                return;
+            }
+        };
+
+        match writer {
+            Ok(writer) => {
+                self.writer = Some(writer);
+                self.error = None;
+            }
+            Err(error) => {
+                self.writer = None;
+                self.error = Some(format!("Could not open {}: {error}", path.display()));
+            }
+        }
+    }
+
+    fn stop_saving(&mut self) {
+        let result = match self.writer.take() {
+            Some(OutputWriter::Binary(mut writer)) => writer.flush(),
+            Some(OutputWriter::Fits(writer)) => writer.finish(),
+            None => return,
+        };
+        if let Err(error) = result {
+            self.error = Some(format!("Could not finish saving: {error}"));
+        }
+    }
+
+    fn write_spectrum(&mut self, spectrum: &[Ftype]) {
+        let result = match self.writer.as_mut() {
+            Some(OutputWriter::Binary(writer)) => Some(write_data(writer, spectrum)),
+            Some(OutputWriter::Fits(writer)) => {
+                Some(writer.write_spectrum(self.current_frequency_hz, spectrum))
+            }
+            None => None,
+        };
+        if let Some(Err(error)) = result {
+            self.writer = None;
+            self.error = Some(format!("Saving stopped: {error}"));
+        }
+    }
+
+    fn set_frequency(&mut self, frequency_hz: f64) {
+        self.current_frequency_hz = frequency_hz;
+    }
+
+    fn selected_format_name(&self) -> &'static str {
+        match self
+            .selected_path
+            .as_deref()
+            .and_then(Path::extension)
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("bin") => "Binary",
+            Some("fits" | "fit") => "FITS table",
+            _ => "Unsupported format",
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn select_save_file() -> Result<Option<PathBuf>, String> {
+    let output = Command::new("osascript")
+        .args([
+            "-e",
+            "set outputFile to choose file name with prompt \"Select .bin or .fits file to save\" default name \"observation.bin\"",
+            "-e",
+            "return POSIX path of outputFile",
+        ])
+        .output()
+        .map_err(|error| format!("Could not open the file chooser: {error}"))?;
+
+    if output.status.success() {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        return Ok((!path.is_empty()).then(|| PathBuf::from(path)));
+    }
+
+    let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    if message.contains("User canceled") || message.contains("(-128)") {
+        Ok(None)
+    } else {
+        Err(if message.is_empty() {
+            "The file chooser closed unexpectedly".to_owned()
+        } else {
+            message
+        })
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn select_save_file() -> Result<Option<PathBuf>, String> {
+    let script = concat!(
+        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ",
+        "Add-Type -AssemblyName System.Windows.Forms; ",
+        "$dialog = New-Object System.Windows.Forms.SaveFileDialog; ",
+        "$dialog.Title = 'Select file to save'; ",
+        "$dialog.FileName = 'observation.bin'; ",
+        "$dialog.Filter = 'Binary data (*.bin)|*.bin|FITS table (*.fits)|*.fits'; ",
+        "$dialog.AddExtension = $true; ",
+        "$dialog.OverwritePrompt = $true; ",
+        "if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) ",
+        "{ [Console]::Write($dialog.FileName) }",
+    );
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-STA", "-Command", script])
+        .output()
+        .map_err(|error| format!("Could not open the file chooser: {error}"))?;
+
+    if output.status.success() {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        Ok((!path.is_empty()).then(|| PathBuf::from(path)))
+    } else {
+        let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        Err(if message.is_empty() {
+            "The file chooser closed unexpectedly".to_owned()
+        } else {
+            message
+        })
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn select_save_file() -> Result<Option<PathBuf>, String> {
+    Err("The save-file chooser is currently available on macOS and Windows only".to_owned())
+}
+
+fn displayed_file_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
+fn configure_bundled_soapy_modules() {
+    if std::env::var_os("SOAPY_SDR_PLUGIN_PATH").is_some() {
+        return;
+    }
+
+    let Some(release_root) = std::env::current_exe()
+        .ok()
+        .and_then(|executable| executable.parent()?.parent().map(Path::to_path_buf))
+    else {
+        return;
+    };
+    let module_path = release_root.join("lib/SoapySDR/modules0.8");
+    if module_path.is_dir() {
+        // This runs before any worker threads or SoapySDR calls are started.
+        unsafe {
+            std::env::set_var("SOAPY_SDR_PLUGIN_PATH", module_path);
+        }
+    }
+}
 
 #[derive(Debug, Parser)]
 #[clap(author, about, version)]
@@ -76,12 +314,7 @@ struct Args {
     #[clap(short('s'), value_name("sampling rate in MHz"), default_value("6"))]
     sampling_rate: u32,
 
-    #[clap(
-        short('o'),
-        long("out"),
-        value_name("out file name"),
-        //default_value("6")
-    )]
+    #[clap(short('o'), long("out"), value_name("out file name"))]
     outname: Option<String>,
 
     #[clap(
@@ -103,16 +336,15 @@ struct State {
     yscale_max: f64,
     ntime: usize,
     nch: usize,
+    spectrum_interval_sec: f64,
     device: Device,
     floor: Option<Array1<f32>>,
-    //outname: Option<String>,
 }
 
 fn db(x: f64) -> f64 {
     x.log10() * 10.0
 }
 
-//const ANTENNA:&str="RX";
 fn main() {
     let args = Args::parse();
 
@@ -120,9 +352,21 @@ fn main() {
         eprintln!("Sampling rate can only be either 3 or 6 MSps");
         return;
     }
+    if args.nch == 0 || args.nch > 8192 || !args.nch.is_power_of_two() {
+        eprintln!("Channel count must be a power of two between 1 and 8192");
+        return;
+    }
+    if args.ntap == 0 || args.ntime == 0 || args.n_average == 0 {
+        eprintln!("PFB taps, displayed rows, and averaging count must be positive");
+        return;
+    }
+    if !(0.0..1.0).contains(&args.k) {
+        eprintln!("Filter parameter k must be in the range [0, 1)");
+        return;
+    }
 
     let sampling_rate = args.sampling_rate as f64 * 1e6;
-    assert_eq!(args.nch & (args.nch - 1), 0);
+    configure_bundled_soapy_modules();
 
     let device = Device::new("driver=airspy").unwrap();
 
@@ -150,9 +394,30 @@ fn main() {
     let ctx = Arc::new(Mutex::new(Option::<Context>::default()));
     let ctx1 = Arc::clone(&ctx);
 
-    //let waterfall_img_buf = Arc::new(Mutex::new(vec![0_u8; (args.ntime * args.nch * 3)]));
     let waterfall_img_buf = Arc::new(Mutex::new(Array2::<f32>::zeros((args.ntime, args.nch))));
     let spectrum_buf = Arc::new(Mutex::new(Array1::<f32>::zeros(args.nch)));
+    let spectrum_interval_sec = args.nch as f64 * args.n_average as f64 / (2.0 * sampling_rate);
+    let observation_metadata = ObservationMetadata {
+        center_frequency_hz: args.f0,
+        sample_rate_hz: sampling_rate,
+        channel_count: args.nch,
+        average_count: args.n_average,
+        pfb_taps: args.ntap,
+        time_resolution_sec: spectrum_interval_sec,
+        lna_gain_db: args.lna,
+        mix_gain_db: args.mix,
+        vga_gain_db: args.vga,
+    };
+    let save_control = Arc::new(Mutex::new(SaveControl::new(
+        args.outname.as_deref().map(PathBuf::from),
+        observation_metadata,
+    )));
+    if args.outname.is_some() {
+        // Preserve the original command-line behavior for .bin files. FITS
+        // starts a fresh standards-compliant table because its header and row
+        // count must describe one recording session.
+        save_control.lock().unwrap().start_saving(true);
+    }
 
     let wimg = waterfall_img_buf.clone();
     let sbuf = spectrum_buf.clone();
@@ -171,28 +436,22 @@ fn main() {
     .unwrap();
 
     let running1 = running.clone();
+    let save_writer = Arc::clone(&save_control);
     let th_display = std::thread::spawn(move || {
         let spectrum_buf = sbuf;
 
         let mut waterfall_buf = Array2::<f32>::ones((args.ntime, args.nch));
         let mut waterfall_buf_tmp = Array2::<f32>::ones((args.ntime, args.nch));
-        //let averaged = rx_averaged.recv().unwrap();
-        //let mut filtered_result = averaged.clone();
         let mut filtered_result = Array1::<f32>::zeros(args.nch);
         loop {
             let averaged = rx_averaged.recv().unwrap();
             if !*running1.lock().unwrap() {
                 return;
             }
-            if let Some(ref outname) = args.outname {
-                //let mut outfile = File::create(outname).unwrap();
-                let mut outfile = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(outname)
-                    .unwrap();
-                write_data(&mut outfile, averaged.as_slice().unwrap());
-            }
+            save_writer
+                .lock()
+                .unwrap()
+                .write_spectrum(averaged.as_slice().unwrap());
 
             filtered_result = filtered_result * args.k + &averaged * (1 as Ftype - args.k);
 
@@ -238,7 +497,9 @@ fn main() {
     let ctx1 = Arc::clone(&ctx);
 
     let native_options = eframe::NativeOptions {
-        viewport: ViewportBuilder::default().with_inner_size(Vec2::new(950.0, 600.0)),
+        viewport: ViewportBuilder::default()
+            .with_inner_size(INITIAL_WINDOW_SIZE)
+            .with_min_inner_size(MIN_WINDOW_SIZE),
         renderer: match args.renderer.as_str() {
             "glow" => Renderer::Glow,
             "wgpu" => Renderer::Wgpu,
@@ -247,21 +508,9 @@ fn main() {
         ..Default::default()
     };
 
-    /*
-    let mut native_options = eframe::NativeOptions::default();
-
-    native_options.viewport = ViewportBuilder::default().with_inner_size(Vec2::new(950.0, 600.0));
-
-    native_options.renderer = match args.renderer.as_str() {
-        "glow" => Renderer::Glow,
-        "wgpu" => Renderer::Wgpu,
-        _ => panic!("renderer can be either wgpu or glow"),
-    };*/
-
     let wimg = waterfall_img_buf.clone();
     let sbuf = spectrum_buf.clone();
-    //let fmin = args.f0 - sampling_rate / 2.0;
-    //let fmax = args.f0 + sampling_rate / 2.0;
+    let save_for_ui = Arc::clone(&save_control);
     let state = State {
         freq: args.f0,
         samp_rate: sampling_rate,
@@ -271,14 +520,25 @@ fn main() {
         yscale_min: 0.0,
         ntime: args.ntime,
         nch: args.nch,
+        // ospfb2 produces two interleaved spectra per `nch` input samples.
+        // One displayed row averages `n_average` of those spectra.
+        spectrum_interval_sec,
         device,
         floor: None,
-        //outname: args.outname.clone(),
     };
     match eframe::run_native(
         "Waterfall",
         native_options,
-        Box::new(move |cc| Ok(Box::new(PlotWindow::new(cc, ctx1, wimg, sbuf, state)))),
+        Box::new(move |cc| {
+            Ok(Box::new(PlotWindow::new(
+                cc,
+                ctx1,
+                wimg,
+                sbuf,
+                state,
+                save_for_ui,
+            )))
+        }),
     ) {
         Ok(_) => {}
         Err(e) => {
@@ -290,20 +550,14 @@ fn main() {
     println!("exit!");
     *running.lock().unwrap() = false;
     th_display.join().unwrap();
-
-    /*
-    th_daq.join().unwrap();
-    th_filter.join().unwrap();
-    th_channelize.join().unwrap();
-    th_update_display.join().unwrap();
-    */
-    //sdr_stream.deactivate(None).expect("failed to deactivate");
+    save_control.lock().unwrap().stop_saving();
 }
 
 struct PlotWindow {
     pub waterfall_img: Arc<Mutex<Array2<f32>>>,
     pub spectrum_buf: Arc<Mutex<Array1<f32>>>,
     pub state: State,
+    pub save_control: Arc<Mutex<SaveControl>>,
 }
 
 impl PlotWindow {
@@ -313,6 +567,7 @@ impl PlotWindow {
         wimg: Arc<Mutex<Array2<f32>>>,
         sbuf: Arc<Mutex<Array1<f32>>>,
         state: State,
+        save_control: Arc<Mutex<SaveControl>>,
     ) -> Self {
         // Disable feathering as it causes artifacts
         let context = &cc.egui_ctx;
@@ -321,7 +576,6 @@ impl PlotWindow {
             tess_options.feathering = false;
         });
 
-        // Also enable light mode
         context.set_visuals(Visuals::light());
         let mut ctx1 = ctx_holder.lock().unwrap();
         *ctx1 = Some(context.clone());
@@ -329,6 +583,7 @@ impl PlotWindow {
             waterfall_img: wimg,
             spectrum_buf: sbuf,
             state,
+            save_control,
         }
     }
 }
@@ -346,17 +601,8 @@ impl eframe::App for PlotWindow {
                 (if a.0 < v { a.0 } else { v }, if a.1 > v { a.1 } else { v })
             });
 
-        if min_value == max_value || min_value == 0.0 {
-            CentralPanel::default().show(ctx, |ui| {
-                ui.centered_and_justified(|ui| {
-                    ui.label("Awaiting PFB buffer being filled...");
-                });
-            });
-            return;
-        }
-
         TopBottomPanel::bottom("playmenu").show(ctx, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("min ch");
 
                 let mut min_ch = self.state.min_ch;
@@ -395,45 +641,95 @@ impl eframe::App for PlotWindow {
 
                 if ui.add(Slider::new(&mut yscale_max, 0.0..=1.0)).changed() {
                     self.state.yscale_max = yscale_max;
-                    //self.state.yscale_min=self.state.yscale_min.max(yscale_max);
                     if self.state.yscale_max - self.state.yscale_min < 0.01 {
                         self.state.yscale_min = self.state.yscale_max - 0.01;
                     }
                 }
 
                 ui.label(format!("F={} MHz", self.state.freq / 1e6));
-                if ui.button("reset").clicked() {
+                if ui.button("Reset").clicked() {
                     self.state.floor = None;
                 }
 
-                if ui.button("excl").clicked() {
+                let is_saving = self.save_control.lock().unwrap().is_saving();
+                if ui
+                    .add_enabled(!is_saving, egui::Button::new("Select file to save"))
+                    .clicked()
+                {
+                    match select_save_file() {
+                        Ok(Some(path)) => self.save_control.lock().unwrap().select_path(path),
+                        Ok(None) => {}
+                        Err(error) => self.save_control.lock().unwrap().error = Some(error),
+                    }
+                }
+
+                if ui.button("Excl").clicked() {
                     self.state.floor = Some(self.spectrum_buf.lock().unwrap().clone());
                 }
-            })
+            });
+
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                let (selected_path, selected_format, is_saving, error) = {
+                    let save = self.save_control.lock().unwrap();
+                    (
+                        save.selected_path.clone(),
+                        save.selected_format_name(),
+                        save.is_saving(),
+                        save.error.clone(),
+                    )
+                };
+
+                ui.label("Save file:");
+                if let Some(path) = selected_path.as_ref() {
+                    ui.label(displayed_file_name(path))
+                        .on_hover_text(path.display().to_string());
+                    ui.weak(format!("({selected_format})"));
+                } else {
+                    ui.weak("No file selected");
+                }
+
+                let save_button = if is_saving {
+                    ui.button("Stop saving")
+                } else {
+                    ui.add_enabled(selected_path.is_some(), egui::Button::new("Start to save"))
+                };
+                if save_button.clicked() {
+                    let mut save = self.save_control.lock().unwrap();
+                    if is_saving {
+                        save.stop_saving();
+                    } else {
+                        // A file chosen through the save dialog is a new
+                        // recording session, so starting replaces its contents.
+                        save.start_saving(false);
+                    }
+                }
+
+                if is_saving {
+                    ui.colored_label(egui::Color32::DARK_GREEN, "Recording");
+                }
+                if let Some(error) = error {
+                    ui.colored_label(egui::Color32::RED, error);
+                }
+            });
         });
 
+        if min_value == max_value || min_value == 0.0 {
+            CentralPanel::default().show(ctx, |ui| {
+                ui.centered_and_justified(|ui| {
+                    ui.label("Awaiting PFB buffer being filled...");
+                });
+            });
+            return;
+        }
+
         CentralPanel::default().show(ctx, |ui| {
-            //println!("{}", ".");
             let root_area = EguiBackend::new(ui).into_drawing_area();
             root_area.fill(&WHITE).unwrap();
-
-            //root_area.fill(&WHITE)?;
-
-            //let root_area = root_area.titled("Image Title", ("sans-serif", 60)).unwrap();
-
-            //let (upper, lower) = root_area.split_evenly((2,1));
             let (upper, lower) = {
                 let a = root_area.split_evenly((2, 1));
                 (a[0].clone(), a[1].clone())
             };
-
-            let (w, h) = upper.dim_in_pixel();
-
-            //println!("{} {}", min_value, max_value);
-
-            //let min_value=-100.0;
-            //let max_value=db(max_value);
-            //println!("{} {}" , min_value, max_value);
 
             let colormap = ViridisRGB;
             let x = self
@@ -455,38 +751,57 @@ impl eframe::App for PlotWindow {
             let fmax_raw = self.state.freq + self.state.samp_rate / 2.0;
             let fmin_display = self.state.min_ch as f64 * df + fmin_raw;
             let fmax_display = self.state.max_ch as f64 * df + fmin_raw;
+            let waterfall_time_span = self.state.spectrum_interval_sec * self.state.ntime as f64;
             let x1 =
                 ((fmin_display - fmin_raw) / self.state.samp_rate * self.state.nch as f64) as u32;
             let x2 =
                 ((fmax_display - fmin_raw) / self.state.samp_rate * self.state.nch as f64) as u32;
 
+            let mut cc = ChartBuilder::on(&upper)
+                .margin_left(PLOT_SIDE_MARGIN)
+                .margin_right(PLOT_SIDE_MARGIN)
+                .set_label_area_size(LabelAreaPosition::Top, HORIZONTAL_LABEL_AREA_SIZE)
+                .set_label_area_size(LabelAreaPosition::Left, VERTICAL_LABEL_AREA_SIZE)
+                .set_label_area_size(LabelAreaPosition::Right, VERTICAL_LABEL_AREA_SIZE)
+                .build_cartesian_2d(
+                    (fmin_raw / 1e6)..(fmax_raw / 1e6),
+                    0.0..-waterfall_time_span,
+                )
+                .unwrap();
+
+            let (plot_width, plot_height) = cc.plotting_area().dim_in_pixel();
+            let (upper_plot_x_pixels, upper_plot_y_pixels) = cc.plotting_area().get_pixel_range();
             let waterfall = DynamicImage::ImageRgb8(
                 RgbImage::from_vec(self.state.nch as u32, self.state.ntime as u32, x).unwrap(),
             )
             .crop(x1, 0, x2 - x1, self.state.ntime as u32)
-            .resize_exact(w - 50, h - 25, Nearest);
+            .resize_exact(plot_width.max(1), plot_height.max(1), Nearest);
 
-            let bmp: BitMapElement<_> =
-                ((fmin_display, -(self.state.ntime as f64)), waterfall).into();
+            let bmp: BitMapElement<_> = ((fmin_display, -waterfall_time_span), waterfall).into();
 
-            //let _x_axis = (-3.4f32..3.4).step(0.1);
-
-            let mut cc = ChartBuilder::on(&upper)
-                .margin_left(20)
-                .margin_right(20)
-                .set_label_area_size(LabelAreaPosition::Top, 25)
-                .set_label_area_size(LabelAreaPosition::Left, 5)
-                .set_label_area_size(LabelAreaPosition::Right, 5)
-                //.set_all_label_area_size(5)
-                //.caption("Sine and Cosine", ("sans-serif", 40))
-                .build_cartesian_2d(
-                    (fmin_raw / 1e6)..(fmax_raw / 1e6),
-                    0.0..(-(self.state.ntime as f64)),
-                )
+            cc.configure_mesh()
+                .x_desc("Frequency (MHz)")
+                .label_style(("sans-serif", AXIS_FONT_SIZE))
+                .axis_desc_style(("sans-serif", AXIS_FONT_SIZE))
+                .draw()
                 .unwrap();
-
-            cc.configure_mesh().draw().unwrap();
             cc.draw_series(std::iter::once(bmp)).unwrap();
+
+            let y_axis_unit_style = TextStyle::from(("sans-serif", AXIS_FONT_SIZE).into_font())
+                .color(&BLACK)
+                .transform(FontTransform::Rotate270)
+                .pos(Pos::new(HPos::Center, VPos::Center));
+            root_area
+                .use_screen_coord()
+                .draw(&Text::new(
+                    "Time (s)",
+                    (
+                        upper_plot_x_pixels.start - Y_AXIS_UNIT_OFFSET,
+                        (upper_plot_y_pixels.start + upper_plot_y_pixels.end) / 2,
+                    ),
+                    y_axis_unit_style.clone(),
+                ))
+                .unwrap();
 
             let spec = self.spectrum_buf.lock().unwrap();
             let spec = if let Some(ref x) = self.state.floor {
@@ -497,39 +812,34 @@ impl eframe::App for PlotWindow {
             let (min_value, max_value) = spec
                 .iter()
                 .enumerate()
-                .filter(|&(ich, _)| {
-                    ich + 10 >= self.state.min_ch && ich <= self.state.max_ch + 10
-                    //true
-                })
-                //.skip(self.state.nch / 4)
-                //.take(self.state.nch / 2)
+                .filter(|&(ich, _)| ich + 10 >= self.state.min_ch && ich <= self.state.max_ch + 10)
                 .fold((1e99, -1e99), |a, (_, &v)| {
                     let v = v as f64;
                     (if a.0 < v { a.0 } else { v }, if a.1 > v { a.1 } else { v })
                 });
-            //println!("{} {}", min_value, max_value);
             let y1 = db(min_value) - 0.5_f64;
             let y2 = db(max_value) + 0.5_f64;
-            //println!("{} {}", min_value, max_value);
             let ys1 = (y2 - y1) * self.state.yscale_min + y1;
             let ys2 = (y2 - y1) * self.state.yscale_max + y1;
 
+            let spectrum_x_min = fmin_display / 1e6 - 0.1;
+            let spectrum_x_max = fmax_display / 1e6 + 0.1;
             let mut cc = ChartBuilder::on(&lower)
-                .margin_left(20)
-                .margin_right(20)
-                .set_label_area_size(LabelAreaPosition::Left, 5)
-                .set_label_area_size(LabelAreaPosition::Right, 5)
-                .set_label_area_size(LabelAreaPosition::Bottom, 25)
-                //.set_all_label_area_size(5)
-                .build_cartesian_2d(
-                    (fmin_display / 1e6 - 0.1)..(fmax_display / 1e6 + 0.1),
-                    ys1..ys2,
-                )
+                .margin_left(PLOT_SIDE_MARGIN)
+                .margin_right(PLOT_SIDE_MARGIN)
+                .set_label_area_size(LabelAreaPosition::Left, VERTICAL_LABEL_AREA_SIZE)
+                .set_label_area_size(LabelAreaPosition::Right, VERTICAL_LABEL_AREA_SIZE)
+                .set_label_area_size(LabelAreaPosition::Bottom, HORIZONTAL_LABEL_AREA_SIZE)
+                .build_cartesian_2d(spectrum_x_min..spectrum_x_max, ys1..ys2)
                 .unwrap();
+            let (lower_plot_x_pixels, lower_plot_y_pixels) = cc.plotting_area().get_pixel_range();
 
-            //println!("{} {}", min_value, max_value);
-
-            cc.configure_mesh().draw().unwrap();
+            cc.configure_mesh()
+                .x_desc("Frequency (MHz)")
+                .label_style(("sans-serif", AXIS_FONT_SIZE))
+                .axis_desc_style(("sans-serif", AXIS_FONT_SIZE))
+                .draw()
+                .unwrap();
             cc.draw_series(LineSeries::new(
                 (0..self.state.nch).map(|ich| {
                     (
@@ -542,6 +852,18 @@ impl eframe::App for PlotWindow {
             ))
             .unwrap();
 
+            root_area
+                .use_screen_coord()
+                .draw(&Text::new(
+                    "Intensity (dB)",
+                    (
+                        lower_plot_x_pixels.start - Y_AXIS_UNIT_OFFSET,
+                        (lower_plot_y_pixels.start + lower_plot_y_pixels.end) / 2,
+                    ),
+                    y_axis_unit_style,
+                ))
+                .unwrap();
+
             root_area.present().unwrap();
             let df = if ctx
                 .input(|input| input.key_pressed(Key::D) | input.key_pressed(Key::ArrowUp))
@@ -552,7 +874,8 @@ impl eframe::App for PlotWindow {
                 1e6
             } else if ctx.input(|input| input.key_pressed(Key::A)) {
                 5e6
-            } else if ctx.input(|input| input.key_pressed(Key::C) | input.key_pressed(Key::ArrowUp))
+            } else if ctx
+                .input(|input| input.key_pressed(Key::C) | input.key_pressed(Key::ArrowDown))
             {
                 -0.1e6
             } else if ctx
@@ -573,9 +896,53 @@ impl eframe::App for PlotWindow {
                     .unwrap();
                 let f = f + df;
                 self.state.freq = f;
+                self.save_control.lock().unwrap().set_frequency(f);
                 self.state.floor = None;
                 println!("freq changed to {f}");
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_metadata(channel_count: usize) -> ObservationMetadata {
+        ObservationMetadata {
+            center_frequency_hz: 1_420_405_751.0,
+            sample_rate_hz: 6_000_000.0,
+            channel_count,
+            average_count: 128,
+            pfb_taps: 4,
+            time_resolution_sec: 0.01,
+            lna_gain_db: 5.0,
+            mix_gain_db: 5.0,
+            vga_gain_db: 5.0,
+        }
+    }
+
+    #[test]
+    fn save_control_writes_selected_file_and_stops_cleanly() {
+        let path =
+            std::env::temp_dir().join(format!("hi_observer_save_test_{}.bin", std::process::id()));
+        let values = [1.25_f32, 2.5_f32, 5.0_f32];
+        let mut save = SaveControl::new(Some(path.clone()), test_metadata(values.len()));
+
+        save.start_saving(false);
+        assert!(save.is_saving());
+        save.write_spectrum(&values);
+        save.stop_saving();
+        assert!(!save.is_saving());
+        assert!(save.error.is_none());
+
+        let bytes = std::fs::read(&path).unwrap();
+        let expected = values
+            .iter()
+            .flat_map(|value| value.to_ne_bytes())
+            .collect::<Vec<_>>();
+        assert_eq!(bytes, expected);
+
+        std::fs::remove_file(path).unwrap();
     }
 }

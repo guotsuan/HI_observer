@@ -36,7 +36,6 @@ impl Simple {
 
 impl eframe::App for Simple {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        
         CentralPanel::default().show(ctx, |ui| {
             println!(".");
             let root = EguiBackend::new(ui).into_drawing_area();

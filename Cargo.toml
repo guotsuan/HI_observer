@@ -27,7 +27,7 @@ version = "0.31.1"
 
 [dependencies.ndarray]
 features = ["rayon"]
-version = "0.16.1"
+version = "0.17.2"
 
 [dependencies.plotters]
 default-features = false

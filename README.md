@@ -124,7 +124,7 @@ cargo run --release --bin channelize -- \
 | 参数 | 必需 | 默认值 | 含义 |
 |---|---:|---:|---|
 | `-f, --freq <Hz>` | 是 | — | 初始中心频率，单位 Hz |
-| `-n, --nch <N>` | 否 | `512` | 频率通道数；必须是 2 的幂且不大于 8192 |
+| `-n, --nch <N>` | 否 | `4096` | 频率通道数；必须是 2 的幂且不大于 8192 |
 | `-t, --tap <N>` | 否 | `4` | PFB 每通道抽头数 |
 | `-y <N>` | 否 | `128` | 界面瀑布图保留的频谱行数 |
 | `-a <N>` | 否 | `128` | 每个输出频谱行平均的瞬时频谱数 |
@@ -140,7 +140,7 @@ cargo run --release --bin channelize -- \
 
 ```bash
 ./target/release/channelize \
-  -f 1420.405751e6 -s 6 -n 512 -t 4 -a 128 -y 256 \
+  -f 1420.405751e6 -s 6 -n 4096 -t 4 -a 128 -y 256 \
   --lna 5 --mix 5 --vga 5 \
   --out observation.fits
 ```
@@ -151,7 +151,7 @@ cargo run --release --bin channelize -- \
 time_resolution = nch × average / (2 × sample_rate)
 ```
 
-例如 `nch=512`、`average=128`、`sample_rate=6 MHz` 时约为 `5.461 ms/行`。因此默认 `-y 128` 只对应约 `0.70 s` 的缓存；脚本显示多少秒取决于数据行数和该时间分辨率，不是固定 4 秒。系统负载过高时数据队列可能丢行，FITS 中的 `TIME` 列使用实际经过时间，可反映这类间隔。
+例如默认 `nch=4096`、`average=128`、`sample_rate=6 MHz` 时约为 `43.691 ms/行`。因此默认 `-y 128` 对应约 `5.59 s` 的缓存；脚本显示多少秒取决于数据行数和该时间分辨率，并非固定时长。系统负载过高时数据队列可能丢行，FITS 中的 `TIME` 列使用实际经过时间，可反映这类间隔。
 
 ## 3. 界面操作
 
@@ -211,7 +211,7 @@ python3 -m pip install numpy matplotlib astropy
 ```bash
 python3 scripts/plot_bin.py observation.bin \
   --center-frequency 1420.405751e6 \
-  --sample-rate 6e6 --nch 512 --average 128 \
+  --sample-rate 6e6 --nch 4096 --average 128 \
   --rows 512 --spectrum-average 32
 ```
 

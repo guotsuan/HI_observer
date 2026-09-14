@@ -27,7 +27,7 @@ struct Args {
         short('n'),
         long("nch"),
         value_name("num of channels, must <=8192"),
-        default_value("512")
+        default_value("4096")
     )]
     nch: usize,
 

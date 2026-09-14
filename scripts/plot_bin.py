@@ -151,7 +151,7 @@ def parse_arguments() -> argparse.Namespace:
         metavar="HZ",
         help="sample rate in Hz (default: 6e6)",
     )
-    parser.add_argument("--nch", type=int, default=512, help="channel count")
+    parser.add_argument("--nch", type=int, default=4096, help="channel count (default: 4096)")
     parser.add_argument(
         "--average",
         type=int,
